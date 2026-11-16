@@ -1,7 +1,9 @@
 package com.strictmode.blocker.data
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -315,6 +317,118 @@ object LockStateManager {
     fun getDraftSelectedPackages(context: Context): Set<String> {
         val prefs = getPrefs(context)
         return prefs.getStringSet(KEY_DRAFT_SELECTED_PACKAGES, emptySet()) ?: emptySet()
+    }
+
+    @Volatile
+    var activeAllowedUserAppPkg: String? = null
+        private set
+
+    @Volatile
+    var activeAllowedUserAppTimeMs: Long = 0L
+        private set
+
+    private var cachedHomePackages: Set<String>? = null
+
+    private val AUTH_PROMPT_KEYWORDS = listOf(
+        "biometric",
+        "fingerprint",
+        "credential",
+        "confirmlock",
+        "password",
+        "keyguard",
+        "autofill",
+        "faceunlock",
+        "applock"
+    )
+
+    private val IGNORED_BACKGROUND_SYSTEM_PREFIXES = listOf(
+        "com.android.systemui",
+        "android",
+        "com.google.android.inputmethod",
+        "com.samsung.android.honeyboard",
+        "com.google.android.packageinstaller",
+        "com.android.packageinstaller",
+        "com.samsung.android.packageinstaller",
+        "com.miui.packageinstaller",
+        "com.google.android.permissioncontroller",
+        "com.android.permissioncontroller"
+    )
+
+    fun getHomeLauncherPackages(context: Context): Set<String> {
+        cachedHomePackages?.let { if (it.isNotEmpty()) return it }
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+        }
+        val pkgs = runCatching {
+            pm.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+                .mapNotNull { it.activityInfo?.packageName }
+                .toSet()
+        }.getOrDefault(emptySet())
+        if (pkgs.isNotEmpty()) {
+            cachedHomePackages = pkgs
+        }
+        return pkgs
+    }
+
+    /**
+     * Records foreground package transitions so we know whether the user is currently inside
+     * an allowed user app (like InstaPay) or on the Home Screen.
+     */
+    @Synchronized
+    fun onForegroundAppObserved(
+        context: Context,
+        pkg: String,
+        state: LockSessionState
+    ) {
+        if (pkg == "com.android.settings") return
+        if (IGNORED_BACKGROUND_SYSTEM_PREFIXES.any { pkg == it || pkg.startsWith(it) }) return
+        if (pkg.contains("inputmethod") || pkg.contains("keyboard")) return
+
+        val homePkgs = getHomeLauncherPackages(context)
+        if (pkg == context.packageName || pkg in homePkgs || pkg in state.blockedPackages) {
+            activeAllowedUserAppPkg = null
+            activeAllowedUserAppTimeMs = 0L
+        } else {
+            // User opened an allowed app (such as InstaPay or Telegram)
+            activeAllowedUserAppPkg = pkg
+            activeAllowedUserAppTimeMs = System.currentTimeMillis()
+        }
+    }
+
+    /**
+     * Determines whether a com.android.settings window should be blocked:
+     * - Blocked when opened from the Home Screen, App Drawer, Quick Settings, or StrictLock.
+     * - Allowed when triggered as a biometric/PIN/security sub-check inside an active allowed app like InstaPay.
+     */
+    @Synchronized
+    fun shouldBlockSettingsWindow(
+        className: String?,
+        state: LockSessionState
+    ): Boolean {
+        if (!state.blockSettingsAndUninstall) return false
+        val lowerClass = className?.lowercase().orEmpty()
+
+        // Always block deactivating Device Admin
+        if (lowerClass.contains("deviceadmin")) return true
+
+        // Never block fingerprint / PIN / pattern / device credential authentication prompts
+        if (AUTH_PROMPT_KEYWORDS.any { lowerClass.contains(it) }) return false
+
+        // Ignore non-activity view containers
+        if (lowerClass.startsWith("android.widget.") || lowerClass.startsWith("android.view.")) {
+            return false
+        }
+
+        // If the user is currently inside an allowed app (like InstaPay) and hasn't returned to Home Screen,
+        // allow sub-settings checks triggered by that app so InstaPay is never falsely blocked.
+        val allowedPkg = activeAllowedUserAppPkg
+        val elapsedSinceAllowedApp = System.currentTimeMillis() - activeAllowedUserAppTimeMs
+        if (allowedPkg != null && elapsedSinceAllowedApp in 0..45_000L) {
+            return false
+        }
+
+        return true
     }
 
     /**

@@ -2,6 +2,8 @@ package com.strictmode.blocker.service
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import com.strictmode.blocker.data.LockStateManager
 
@@ -17,6 +19,9 @@ class StrictAccessibilityService : AccessibilityService() {
         )
     }
 
+    private val handler = Handler(Looper.getMainLooper())
+    private var pendingSettingsBlockRunnable: Runnable? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         val state = LockStateManager.refreshState(this)
@@ -31,7 +36,6 @@ class StrictAccessibilityService : AccessibilityService() {
         }
 
         val eventClass = event.className?.toString().orEmpty()
-        // Ignore notifications, toasts, and non-activity popups
         if (eventClass.startsWith("android.app.Notification") ||
             eventClass.startsWith("android.widget.Toast")
         ) {
@@ -40,24 +44,32 @@ class StrictAccessibilityService : AccessibilityService() {
 
         val state = LockStateManager.refreshState(this)
         if (!state.isLocked) {
+            cancelPendingSettingsBlock()
             return
         }
 
         val foregroundPkg = event.packageName?.toString() ?: return
+
+        // Update shared foreground app tracker
+        LockStateManager.onForegroundAppObserved(this, foregroundPkg, state)
+
         if (foregroundPkg == packageName) {
+            cancelPendingSettingsBlock()
             return
         }
 
         // 1. Check if the Power Off / Restart menu dialog is open via class name
         if (state.blockPowerMenu && detectPowerMenuByClass(foregroundPkg, eventClass)) {
+            cancelPendingSettingsBlock()
             blockAndDismiss(
                 reason = "Anti-Cheat: Power Off & Restart are locked during an active timer"
             )
             return
         }
 
-        // 2. Block ONLY if the opened window belongs to an app explicitly in state.blockedPackages
+        // 2. Block if the opened window belongs to an app explicitly in state.blockedPackages
         if (foregroundPkg in state.blockedPackages) {
+            cancelPendingSettingsBlock()
             val readableName = getReadableAppName(foregroundPkg)
             blockAndDismiss(
                 reason = "Blocked App: $readableName is locked until its timer ends",
@@ -66,28 +78,44 @@ class StrictAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 3. Block Android Settings while timer is active (excluding biometric/fingerprint prompts used by banking apps)
-        val classLower = eventClass.lowercase()
-        val isBiometricPrompt = classLower.contains("biometric") || classLower.contains("fingerprint")
-        if (state.blockSettingsAndUninstall &&
-            foregroundPkg == "com.android.settings" &&
-            !isBiometricPrompt
-        ) {
-            blockAndDismiss(
-                reason = "Anti-Cheat: Phone Settings are locked during an active timer"
-            )
+        // 3. Check if Phone Settings was opened directly (and not as a sub-check inside InstaPay)
+        if (foregroundPkg == "com.android.settings") {
+            if (LockStateManager.shouldBlockSettingsWindow(eventClass, state)) {
+                scheduleSettingsBlockVerification()
+            }
             return
         }
 
-        // 4. If user switched to an allowed app (like InstaPay, Telegram, or Home Launcher)
-        // and the shield was still open from an earlier attempt (> 1200ms ago), auto-dismiss it!
-        if (foregroundPkg != "com.android.systemui" &&
-            foregroundPkg != "android" &&
-            OverlayShieldManager.isShieldShowing() &&
-            System.currentTimeMillis() - OverlayShieldManager.lastShownTimestampMs > 1200L
-        ) {
-            OverlayShieldManager.dismissShield(this)
+        // 4. If user switched to an allowed user app (like InstaPay or Telegram),
+        // cancel any pending Settings block and immediately dismiss any leftover shield!
+        if (LockStateManager.activeAllowedUserAppPkg != null) {
+            cancelPendingSettingsBlock()
+            if (OverlayShieldManager.isShieldShowing()) {
+                OverlayShieldManager.dismissShield(this)
+            }
         }
+    }
+
+    private fun scheduleSettingsBlockVerification() {
+        cancelPendingSettingsBlock()
+        val runnable = Runnable {
+            val state = LockStateManager.refreshState(this)
+            if (state.isLocked &&
+                state.blockSettingsAndUninstall &&
+                LockStateManager.activeAllowedUserAppPkg == null
+            ) {
+                blockAndDismiss(
+                    reason = "Anti-Cheat: Phone Settings are locked during an active timer"
+                )
+            }
+        }
+        pendingSettingsBlockRunnable = runnable
+        handler.postDelayed(runnable, 350L)
+    }
+
+    private fun cancelPendingSettingsBlock() {
+        pendingSettingsBlockRunnable?.let { handler.removeCallbacks(it) }
+        pendingSettingsBlockRunnable = null
     }
 
     private fun detectPowerMenuByClass(foregroundPkg: String, eventClass: String): Boolean {
@@ -128,6 +156,7 @@ class StrictAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        cancelPendingSettingsBlock()
         OverlayShieldManager.dismissShield(this)
         return super.onUnbind(intent)
     }

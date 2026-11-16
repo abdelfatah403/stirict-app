@@ -93,7 +93,7 @@ class LockEnforcementService : Service() {
                     break
                 }
 
-                // Poll foreground app every 300ms via UsageStatsManager (100% InstaPay / Banking safe!)
+                // Poll foreground app every 300ms via UsageStatsManager
                 checkForegroundAppViaUsageStats(state)
 
                 // Update notification once every ~900ms (every 3rd tick)
@@ -107,7 +107,7 @@ class LockEnforcementService : Service() {
         }
     }
 
-    private fun checkForegroundAppViaUsageStats(state: LockSessionState) {
+    private suspend fun checkForegroundAppViaUsageStats(state: LockSessionState) {
         if (!PermissionHelper.isUsageStatsPermissionGranted(this)) return
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return
@@ -131,7 +131,11 @@ class LockEnforcementService : Service() {
             if (event.timeStamp <= queryStart) continue
 
             if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
-                latestResumedPkg = event.packageName
+                val pkg = event.packageName ?: continue
+                // Track chronological app transitions so opening InstaPay before a sub-settings
+                // check is always recognized!
+                LockStateManager.onForegroundAppObserved(this, pkg, state)
+                latestResumedPkg = pkg
                 latestResumedClass = event.className
                 if (event.timeStamp > latestEventTimestamp) {
                     latestEventTimestamp = event.timeStamp
@@ -146,7 +150,7 @@ class LockEnforcementService : Service() {
         val currentPkg = latestResumedPkg ?: return
         if (currentPkg == packageName) return
 
-        // 1. Block ONLY if the foreground package is explicitly in the user's selected blockedPackages list
+        // 1. Block if the foreground package is explicitly in the user's selected blockedPackages list
         if (currentPkg in state.blockedPackages) {
             val appName = getReadableAppName(currentPkg)
             val reason = "Blocked App: $appName is locked until its timer ends"
@@ -161,30 +165,46 @@ class LockEnforcementService : Service() {
             return
         }
 
-        // 2. Block Android Settings while timer is active (excluding biometric/fingerprint prompts used by banking apps)
-        val classLower = latestResumedClass?.lowercase().orEmpty()
-        val isBiometricPrompt = classLower.contains("biometric") || classLower.contains("fingerprint")
-        if (state.blockSettingsAndUninstall &&
-            currentPkg == "com.android.settings" &&
-            !isBiometricPrompt
+        // 2. Check if Phone Settings was opened directly (not as a sub-check inside an allowed app like InstaPay)
+        if (currentPkg == "com.android.settings" &&
+            LockStateManager.shouldBlockSettingsWindow(latestResumedClass, state)
         ) {
-            val reason = "Anti-Cheat: Phone Settings are locked during an active timer"
-            LockStateManager.recordViolation(this, reason)
-            OverlayShieldManager.navigateToHomeLauncher(this)
-            OverlayShieldManager.showShield(
-                context = this,
-                reasonTitle = reason,
-                useAccessibilityOverlay = false
-            )
+            // Wait 350ms and check if an allowed app (like InstaPay) just resumed right after a transient check
+            delay(350L)
+            pollLatestEventsOnly(usm, state)
+            if (LockStateManager.activeAllowedUserAppPkg == null) {
+                val reason = "Anti-Cheat: Phone Settings are locked during an active timer"
+                LockStateManager.recordViolation(this, reason)
+                OverlayShieldManager.navigateToHomeLauncher(this)
+                OverlayShieldManager.showShield(
+                    context = this,
+                    reasonTitle = reason,
+                    useAccessibilityOverlay = false
+                )
+            }
             return
         }
 
-        // 3. If the user switched to any allowed app (like InstaPay, Telegram, or Home Launcher)
-        // and the shield was still open from an earlier attempt (> 1200ms ago), auto-dismiss it!
-        if (OverlayShieldManager.isShieldShowing() &&
-            now - OverlayShieldManager.lastShownTimestampMs > 1200L
-        ) {
+        // 3. If an allowed user app (like InstaPay or Telegram) is active in the foreground,
+        // dismiss any leftover shield immediately!
+        if (LockStateManager.activeAllowedUserAppPkg != null && OverlayShieldManager.isShieldShowing()) {
             OverlayShieldManager.dismissShield(this)
+        }
+    }
+
+    private fun pollLatestEventsOnly(usm: UsageStatsManager, state: LockSessionState) {
+        val now = System.currentTimeMillis()
+        val events = runCatching { usm.queryEvents(lastProcessedEventTimeMs, now) }.getOrNull() ?: return
+        val ev = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(ev)
+            if (ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                val pkg = ev.packageName ?: continue
+                LockStateManager.onForegroundAppObserved(this, pkg, state)
+                if (ev.timeStamp > lastProcessedEventTimeMs) {
+                    lastProcessedEventTimeMs = ev.timeStamp
+                }
+            }
         }
     }
 
