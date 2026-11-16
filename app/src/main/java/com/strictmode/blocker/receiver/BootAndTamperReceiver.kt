@@ -19,7 +19,7 @@ class BootAndTamperReceiver : BroadcastReceiver() {
                 LockStateManager.onDeviceShuttingDown(context)
             }
 
-            Intent.ACTION_TIME_SET,
+            Intent.ACTION_TIME_CHANGED,
             Intent.ACTION_TIMEZONE_CHANGED -> {
                 // System clock or timezone changed — our timer uses SystemClock.elapsedRealtime()
                 // so it is completely unaffected, but we log the tamper attempt if locked.
