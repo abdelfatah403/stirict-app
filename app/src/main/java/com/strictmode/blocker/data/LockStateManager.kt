@@ -175,13 +175,29 @@ object LockStateManager {
     }
 
     /**
-     * Saves the user's selected blocked packages even before starting the timer.
+     * Saves the user's selected blocked packages before starting the timer.
      */
     @Synchronized
     fun saveSelectedPackages(context: Context, packages: Set<String>) {
         val prefs = getPrefs(context)
-        if (prefs.getBoolean(KEY_IS_LOCKED, false)) return // Cannot edit while locked!
+        if (prefs.getBoolean(KEY_IS_LOCKED, false)) return // Cannot remove apps while locked!
         prefs.edit().putStringSet(KEY_BLOCKED_PACKAGES, packages).apply()
+        refreshState(context)
+    }
+
+    /**
+     * Allows adding more apps to an already running lock timer.
+     * Existing locked apps are strictly preserved and cannot be removed until the timer ends.
+     */
+    @Synchronized
+    fun addPackagesToActiveLock(context: Context, additionalPackages: Set<String>) {
+        if (additionalPackages.isEmpty()) return
+        val prefs = getPrefs(context)
+        val currentBlocked = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet()
+        val mergedBlocked = currentBlocked + additionalPackages
+        prefs.edit()
+            .putStringSet(KEY_BLOCKED_PACKAGES, mergedBlocked)
+            .commit()
         refreshState(context)
     }
 

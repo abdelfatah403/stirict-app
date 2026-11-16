@@ -35,6 +35,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
@@ -856,6 +857,11 @@ private fun ActiveLockDashboard(
     lockState: LockSessionState,
     installedApps: List<InstalledAppInfo>
 ) {
+    val context = LocalContext.current
+    var showAddAppsDialog by remember { mutableStateOf(false) }
+    var addSearchQuery by remember { mutableStateOf("") }
+    var pendingAdditions by remember { mutableStateOf<Set<String>>(emptySet()) }
+
     val progress = if (lockState.totalDurationMs > 0L) {
         (lockState.remainingMs.toFloat() / lockState.totalDurationMs.toFloat()).coerceIn(0f, 1f)
     } else {
@@ -864,6 +870,18 @@ private fun ActiveLockDashboard(
 
     val blockedAppModels = remember(installedApps, lockState.blockedPackages) {
         installedApps.filter { it.packageName in lockState.blockedPackages }
+    }
+
+    val unlockedAppModels = remember(installedApps, lockState.blockedPackages, addSearchQuery) {
+        val unlocked = installedApps.filter { it.packageName !in lockState.blockedPackages }
+        if (addSearchQuery.isBlank()) {
+            unlocked
+        } else {
+            val q = addSearchQuery.trim().lowercase()
+            unlocked.filter {
+                it.appName.lowercase().contains(q) || it.packageName.lowercase().contains(q)
+            }
+        }
     }
 
     LazyColumn(
@@ -964,13 +982,41 @@ private fun ActiveLockDashboard(
         }
 
         item {
-            Text(
-                text = "Locked Apps (${lockState.blockedPackages.size})",
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = 15.sp,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Locked Apps (${lockState.blockedPackages.size})",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
+                Button(
+                    onClick = {
+                        pendingAdditions = emptySet()
+                        addSearchQuery = ""
+                        showAddAppsDialog = true
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Add Apps to Timer",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
         }
 
         items(
@@ -1006,6 +1052,111 @@ private fun ActiveLockDashboard(
                 )
             }
         }
+    }
+
+    if (showAddAppsDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddAppsDialog = false },
+            containerColor = Color(0xFF161B22),
+            titleContentColor = Color.White,
+            textContentColor = Color(0xFFC9D1D9),
+            title = {
+                Text(
+                    text = "Add Apps to Active Timer",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(400.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Select additional apps to lock for the remaining timer. Once added, they cannot be unlocked until the timer reaches 00:00.",
+                        fontSize = 12.sp,
+                        color = Color(0xFF8B949E)
+                    )
+
+                    OutlinedTextField(
+                        value = addSearchQuery,
+                        onValueChange = { addSearchQuery = it },
+                        placeholder = { Text("Search unlocked apps...") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Search,
+                                contentDescription = null,
+                                tint = Color(0xFF8B949E)
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFFEF4444),
+                            unfocusedBorderColor = Color(0xFF30363D),
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White
+                        )
+                    )
+
+                    LazyColumn(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(
+                            items = unlockedAppModels,
+                            key = { it.packageName }
+                        ) { app ->
+                            val isSelected = app.packageName in pendingAdditions
+                            AppSelectionRow(
+                                app = app,
+                                isSelected = isSelected,
+                                onToggle = {
+                                    pendingAdditions = if (isSelected) {
+                                        pendingAdditions - app.packageName
+                                    } else {
+                                        pendingAdditions + app.packageName
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (pendingAdditions.isNotEmpty()) {
+                            LockStateManager.addPackagesToActiveLock(context, pendingAdditions)
+                            LockEnforcementService.startOrUpdate(context)
+                            Toast.makeText(
+                                context,
+                                "Locked ${pendingAdditions.size} additional app(s)!",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        showAddAppsDialog = false
+                    },
+                    enabled = pendingAdditions.isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
+                ) {
+                    Text(
+                        text = "Lock Selected (${pendingAdditions.size})",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddAppsDialog = false }) {
+                    Text("Cancel", color = Color(0xFF8B949E))
+                }
+            }
+        )
     }
 }
 
