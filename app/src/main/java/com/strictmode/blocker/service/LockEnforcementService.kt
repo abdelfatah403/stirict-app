@@ -33,14 +33,6 @@ class LockEnforcementService : Service() {
         private const val CHANNEL_ID = "strict_lock_timer_channel"
         private const val NOTIFICATION_ID = 1001
 
-        private val SETTINGS_AND_INSTALLER_PACKAGES = setOf(
-            "com.android.settings",
-            "com.google.android.packageinstaller",
-            "com.android.packageinstaller",
-            "com.samsung.android.packageinstaller",
-            "com.miui.packageinstaller"
-        )
-
         fun startOrUpdate(context: Context) {
             val intent = Intent(context, LockEnforcementService::class.java)
             runCatching {
@@ -55,11 +47,11 @@ class LockEnforcementService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var tickerJob: Job? = null
-    private var lastKnownForegroundPkg: String? = null
-    private var lastBlockedTimestampMs: Long = 0L
+    private var lastProcessedEventTimeMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
+        lastProcessedEventTimeMs = System.currentTimeMillis()
         createNotificationChannel()
     }
 
@@ -89,6 +81,7 @@ class LockEnforcementService : Service() {
 
     private fun startCountdownAndEnforcementLoop() {
         if (tickerJob?.isActive == true) return
+        lastProcessedEventTimeMs = System.currentTimeMillis()
         tickerJob = serviceScope.launch {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             var tickCount = 0
@@ -119,30 +112,42 @@ class LockEnforcementService : Service() {
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return
         val now = System.currentTimeMillis()
-        val usageEvents = runCatching { usm.queryEvents(now - 4000L, now) }.getOrNull() ?: return
+        val queryStart = maxOf(
+            now - 2500L,
+            lastProcessedEventTimeMs,
+            OverlayShieldManager.lastDismissedTimestampMs
+        )
+        if (queryStart >= now) return
+
+        val usageEvents = runCatching { usm.queryEvents(queryStart, now) }.getOrNull() ?: return
 
         val event = UsageEvents.Event()
         var latestResumedPkg: String? = null
+        var latestResumedClass: String? = null
+        var latestEventTimestamp = lastProcessedEventTimeMs
+
         while (usageEvents.hasNextEvent()) {
             usageEvents.getNextEvent(event)
+            if (event.timeStamp <= queryStart) continue
+
             if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
                 latestResumedPkg = event.packageName
+                latestResumedClass = event.className
+                if (event.timeStamp > latestEventTimestamp) {
+                    latestEventTimestamp = event.timeStamp
+                }
             }
         }
 
-        if (latestResumedPkg != null) {
-            lastKnownForegroundPkg = latestResumedPkg
+        if (latestEventTimestamp > lastProcessedEventTimeMs) {
+            lastProcessedEventTimeMs = latestEventTimestamp
         }
 
-        val currentPkg = lastKnownForegroundPkg ?: return
+        val currentPkg = latestResumedPkg ?: return
         if (currentPkg == packageName) return
 
-        // Avoid spamming if we just blocked within the last 800ms
-        if (now - lastBlockedTimestampMs < 800L) return
-
+        // 1. Block ONLY if the foreground package is explicitly in the user's selected blockedPackages list
         if (currentPkg in state.blockedPackages) {
-            lastBlockedTimestampMs = now
-            lastKnownForegroundPkg = null
             val appName = getReadableAppName(currentPkg)
             val reason = "Blocked App: $appName is locked until its timer ends"
             LockStateManager.recordViolation(this, reason, currentPkg)
@@ -156,10 +161,13 @@ class LockEnforcementService : Service() {
             return
         }
 
-        if (state.blockSettingsAndUninstall && currentPkg in SETTINGS_AND_INSTALLER_PACKAGES) {
-            lastBlockedTimestampMs = now
-            lastKnownForegroundPkg = null
-            val reason = "Anti-Cheat: Settings & App Uninstall are locked during an active timer"
+        // 2. Only block the explicit Device Admin deactivation screen if user tries to disable Device Admin
+        val classLower = latestResumedClass?.lowercase().orEmpty()
+        if (state.blockSettingsAndUninstall &&
+            currentPkg == "com.android.settings" &&
+            classLower.contains("deviceadmin")
+        ) {
+            val reason = "Anti-Cheat: Deactivating Device Admin is locked during an active timer"
             LockStateManager.recordViolation(this, reason)
             OverlayShieldManager.navigateToHomeLauncher(this)
             OverlayShieldManager.showShield(
@@ -167,6 +175,15 @@ class LockEnforcementService : Service() {
                 reasonTitle = reason,
                 useAccessibilityOverlay = false
             )
+            return
+        }
+
+        // 3. If the user switched to any allowed app (like InstaPay, Telegram, or Home Launcher)
+        // and the shield was still open from an earlier attempt (> 1200ms ago), auto-dismiss it!
+        if (OverlayShieldManager.isShieldShowing() &&
+            now - OverlayShieldManager.lastShownTimestampMs > 1200L
+        ) {
+            OverlayShieldManager.dismissShield(this)
         }
     }
 

@@ -30,6 +30,18 @@ object OverlayShieldManager {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isShowing = false
 
+    @Volatile
+    var lastShownTimestampMs: Long = 0L
+        private set
+
+    @Volatile
+    var lastDismissedTimestampMs: Long = 0L
+        private set
+
+    fun isShieldShowing(): Boolean = isShowing
+
+    fun getActiveBlockedPackage(): String? = activeBlockedPackage
+
     private val tickerRunnable = object : Runnable {
         override fun run() {
             val view = overlayView ?: return
@@ -52,8 +64,7 @@ object OverlayShieldManager {
     }
 
     /**
-     * Shows an instant full-screen blocking shield using TYPE_ACCESSIBILITY_OVERLAY
-     * (when called from StrictAccessibilityService) or TYPE_APPLICATION_OVERLAY.
+     * Shows an instant full-screen blocking shield using TYPE_APPLICATION_OVERLAY.
      */
     fun showShield(
         context: Context,
@@ -72,6 +83,7 @@ object OverlayShieldManager {
             if (!state.isLocked || targetRemainingMs <= 0L) return@post
 
             activeBlockedPackage = blockedPackage
+            lastShownTimestampMs = System.currentTimeMillis()
 
             if (isShowing && overlayView != null) {
                 reasonTextView?.text = reasonTitle
@@ -109,8 +121,8 @@ object OverlayShieldManager {
             }
 
             val rootLayout = buildShieldView(context, reasonTitle, targetRemainingMs, state.tamperAttempts) {
-                onGoHomeClicked?.invoke() ?: navigateToHomeLauncher(context)
                 dismissShield(context)
+                onGoHomeClicked?.invoke() ?: navigateToHomeLauncher(context)
             }
 
             runCatching {
@@ -126,6 +138,7 @@ object OverlayShieldManager {
     fun dismissShield(context: Context) {
         mainHandler.post {
             mainHandler.removeCallbacks(tickerRunnable)
+            lastDismissedTimestampMs = System.currentTimeMillis()
             val view = overlayView ?: return@post
             val wm = view.context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             runCatching {
@@ -222,7 +235,7 @@ object OverlayShieldManager {
         timerCard.addView(countdownView)
 
         val subMessageView = TextView(context).apply {
-            text = "Anti-Cheat is enabled: Uninstalling, Settings, Force Stop, and Power Off / Restart are locked until the timer finishes."
+            text = "This app is locked until its countdown finishes. Other unselected apps on your phone remain open and available."
             setTextColor(Color.parseColor("#8B949E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             gravity = Gravity.CENTER

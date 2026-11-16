@@ -8,15 +8,6 @@ import com.strictmode.blocker.data.LockStateManager
 class StrictAccessibilityService : AccessibilityService() {
 
     companion object {
-        // Only the actual Android Settings app and Package Installers
-        private val SETTINGS_AND_INSTALLER_PACKAGES = setOf(
-            "com.android.settings",
-            "com.google.android.packageinstaller",
-            "com.android.packageinstaller",
-            "com.samsung.android.packageinstaller",
-            "com.miui.packageinstaller"
-        )
-
         // Exact system Power Menu dialog class names
         private val POWER_MENU_CLASS_KEYWORDS = listOf(
             "globalactions",
@@ -40,7 +31,7 @@ class StrictAccessibilityService : AccessibilityService() {
         }
 
         val eventClass = event.className?.toString().orEmpty()
-        // Ignore notifications, toasts, and non-window state events
+        // Ignore notifications, toasts, and non-activity popups
         if (eventClass.startsWith("android.app.Notification") ||
             eventClass.startsWith("android.widget.Toast")
         ) {
@@ -65,7 +56,7 @@ class StrictAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 2. Check if the opened window belongs to a blocked app
+        // 2. Block ONLY if the opened window belongs to an app explicitly in state.blockedPackages
         if (foregroundPkg in state.blockedPackages) {
             val readableName = getReadableAppName(foregroundPkg)
             blockAndDismiss(
@@ -75,11 +66,26 @@ class StrictAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 3. Check if the user opened Android Settings or Package Installer
-        if (state.blockSettingsAndUninstall && foregroundPkg in SETTINGS_AND_INSTALLER_PACKAGES) {
+        // 3. Only block the explicit Device Admin deactivation screen if user tries to disable Device Admin
+        val classLower = eventClass.lowercase()
+        if (state.blockSettingsAndUninstall &&
+            foregroundPkg == "com.android.settings" &&
+            classLower.contains("deviceadmin")
+        ) {
             blockAndDismiss(
-                reason = "Anti-Cheat: Settings & App Uninstall are locked during an active timer"
+                reason = "Anti-Cheat: Deactivating Device Admin is locked during an active timer"
             )
+            return
+        }
+
+        // 4. If user switched to an allowed app (like InstaPay, Telegram, or Home Launcher)
+        // and the shield was still open from an earlier attempt (> 1200ms ago), auto-dismiss it!
+        if (foregroundPkg != "com.android.systemui" &&
+            foregroundPkg != "android" &&
+            OverlayShieldManager.isShieldShowing() &&
+            System.currentTimeMillis() - OverlayShieldManager.lastShownTimestampMs > 1200L
+        ) {
+            OverlayShieldManager.dismissShield(this)
         }
     }
 
