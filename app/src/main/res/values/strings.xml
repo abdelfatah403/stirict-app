@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">StrictLock</string>
+    <string name="accessibility_service_label">StrictLock Anti-Cheat &amp; App Blocker</string>
+    <string name="accessibility_service_description">Monitors active apps during a lock timer to block restricted apps, prevent uninstalling or force-stopping via Settings, and block the Power/Restart menu while locked.</string>
+    <string name="device_admin_label">StrictLock Uninstall Protection</string>
+    <string name="device_admin_description">Prevents StrictLock from being uninstalled while a strict focus timer is active.</string>
+    <string name="device_admin_disable_warning">StrictLock is protecting your focus session. Deactivating Device Admin is blocked during an active timer!</string>
+</resources>
