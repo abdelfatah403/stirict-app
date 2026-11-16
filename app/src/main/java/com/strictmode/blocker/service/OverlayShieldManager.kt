@@ -26,6 +26,7 @@ object OverlayShieldManager {
     private var reasonTextView: TextView? = null
     private var timerTextView: TextView? = null
     private var attemptsTextView: TextView? = null
+    private var activeBlockedPackage: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isShowing = false
 
@@ -33,11 +34,18 @@ object OverlayShieldManager {
         override fun run() {
             val view = overlayView ?: return
             val state = LockStateManager.refreshState(view.context)
-            if (!state.isLocked) {
+            val pkg = activeBlockedPackage
+            val targetRemainingMs = if (pkg != null) {
+                state.appTimers[pkg]?.remainingMs ?: 0L
+            } else {
+                state.remainingMs
+            }
+
+            if (!state.isLocked || targetRemainingMs <= 0L) {
                 dismissShield(view.context)
                 return
             }
-            timerTextView?.text = formatDuration(state.remainingMs)
+            timerTextView?.text = formatDuration(targetRemainingMs)
             attemptsTextView?.text = "Blocked Cheat / Open Attempts: ${state.tamperAttempts}"
             mainHandler.postDelayed(this, 1000L)
         }
@@ -50,16 +58,24 @@ object OverlayShieldManager {
     fun showShield(
         context: Context,
         reasonTitle: String,
+        blockedPackage: String? = null,
         useAccessibilityOverlay: Boolean = false,
         onGoHomeClicked: (() -> Unit)? = null
     ) {
         mainHandler.post {
             val state = LockStateManager.refreshState(context)
-            if (!state.isLocked) return@post
+            val targetRemainingMs = if (blockedPackage != null) {
+                state.appTimers[blockedPackage]?.remainingMs ?: state.remainingMs
+            } else {
+                state.remainingMs
+            }
+            if (!state.isLocked || targetRemainingMs <= 0L) return@post
+
+            activeBlockedPackage = blockedPackage
 
             if (isShowing && overlayView != null) {
                 reasonTextView?.text = reasonTitle
-                timerTextView?.text = formatDuration(state.remainingMs)
+                timerTextView?.text = formatDuration(targetRemainingMs)
                 attemptsTextView?.text = "Blocked Cheat / Open Attempts: ${state.tamperAttempts}"
                 return@post
             }
@@ -92,7 +108,7 @@ object OverlayShieldManager {
                 gravity = Gravity.CENTER
             }
 
-            val rootLayout = buildShieldView(context, reasonTitle, state.remainingMs, state.tamperAttempts) {
+            val rootLayout = buildShieldView(context, reasonTitle, targetRemainingMs, state.tamperAttempts) {
                 onGoHomeClicked?.invoke() ?: navigateToHomeLauncher(context)
                 dismissShield(context)
             }
@@ -119,6 +135,7 @@ object OverlayShieldManager {
             reasonTextView = null
             timerTextView = null
             attemptsTextView = null
+            activeBlockedPackage = null
             isShowing = false
         }
     }

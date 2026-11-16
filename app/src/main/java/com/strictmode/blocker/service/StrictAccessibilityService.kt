@@ -94,7 +94,8 @@ class StrictAccessibilityService : AccessibilityService() {
         if (pkgName in state.blockedPackages) {
             val readableName = getReadableAppName(pkgName)
             blockAndDismiss(
-                reason = "Blocked App: $readableName is locked until the timer ends"
+                reason = "Blocked App: $readableName is locked until its timer ends",
+                blockedPackage = pkgName
             )
             return
         }
@@ -200,8 +201,8 @@ class StrictAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun blockAndDismiss(reason: String) {
-        LockStateManager.recordViolation(this, reason)
+    private fun blockAndDismiss(reason: String, blockedPackage: String? = null) {
+        LockStateManager.recordViolation(this, reason, blockedPackage)
 
         // Dismiss system dialogs, back out, and return to Home screen immediately
         runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }
@@ -211,6 +212,7 @@ class StrictAccessibilityService : AccessibilityService() {
         OverlayShieldManager.showShield(
             context = this,
             reasonTitle = reason,
+            blockedPackage = blockedPackage,
             useAccessibilityOverlay = true,
             onGoHomeClicked = {
                 runCatching { performGlobalAction(GLOBAL_ACTION_HOME) }

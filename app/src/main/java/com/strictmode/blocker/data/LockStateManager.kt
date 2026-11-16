@@ -7,30 +7,38 @@ import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONObject
+
+data class AppTimerState(
+    val packageName: String,
+    val remainingMs: Long,
+    val totalDurationMs: Long
+)
 
 data class LockSessionState(
     val isLocked: Boolean = false,
     val remainingMs: Long = 0L,
     val totalDurationMs: Long = 0L,
     val blockedPackages: Set<String> = emptySet(),
+    val appTimers: Map<String, AppTimerState> = emptyMap(),
     val blockSettingsAndUninstall: Boolean = true,
     val blockPowerMenu: Boolean = true,
     val tamperAttempts: Int = 0,
-    val lastBlockedReason: String? = null
+    val lastBlockedReason: String? = null,
+    val lastBlockedPackage: String? = null
 )
 
 object LockStateManager {
     private const val PREFS_NAME = "strict_lock_direct_boot_prefs"
 
-    private const val KEY_IS_LOCKED = "is_locked"
-    private const val KEY_TOTAL_DURATION_MS = "total_duration_ms"
-    private const val KEY_ACCUMULATED_ELAPSED_MS = "accumulated_elapsed_ms"
+    private const val KEY_APP_TIMERS_JSON = "app_timers_json"
     private const val KEY_LAST_BOOT_REALTIME_MS = "last_boot_realtime_ms"
-    private const val KEY_BLOCKED_PACKAGES = "blocked_packages"
+    private const val KEY_DRAFT_SELECTED_PACKAGES = "draft_selected_packages"
     private const val KEY_BLOCK_SETTINGS = "block_settings"
     private const val KEY_BLOCK_POWER_MENU = "block_power_menu"
     private const val KEY_TAMPER_ATTEMPTS = "tamper_attempts"
     private const val KEY_LAST_BLOCKED_REASON = "last_blocked_reason"
+    private const val KEY_LAST_BLOCKED_PACKAGE = "last_blocked_package"
 
     private val _stateFlow = MutableStateFlow(LockSessionState())
     val stateFlow: StateFlow<LockSessionState> = _stateFlow.asStateFlow()
@@ -49,8 +57,10 @@ object LockStateManager {
     }
 
     /**
-     * Starts a new strict lock session using the monotonic hardware clock
-     * (SystemClock.elapsedRealtime()) so changing the system date/time cannot cheat the timer.
+     * Locks one or multiple apps for [durationMinutes].
+     * - If multiple apps are passed, they share the same countdown duration.
+     * - If an app is already locked with a shorter remaining time, its timer is extended.
+     *   (An active timer can never be shortened or cancelled early.)
      */
     @Synchronized
     fun startLockSession(
@@ -60,77 +70,170 @@ object LockStateManager {
         blockSettingsAndUninstall: Boolean = true,
         blockPowerMenu: Boolean = true
     ) {
-        val totalDurationMs = durationMinutes.coerceAtLeast(1) * 60_000L
-        val nowRealtime = SystemClock.elapsedRealtime()
+        val durationMs = durationMinutes.coerceAtLeast(1) * 60_000L
+        lockPackagesWithDurationMs(
+            context = context,
+            durationMs = durationMs,
+            packages = blockedPackages,
+            blockSettingsAndUninstall = blockSettingsAndUninstall,
+            blockPowerMenu = blockPowerMenu
+        )
+    }
+
+    /**
+     * Locks multiple apps where each app can either share the default duration or have its own
+     * custom duration in minutes.
+     */
+    @Synchronized
+    fun startLockSessionWithCustomTimers(
+        context: Context,
+        appDurationMinutesMap: Map<String, Int>,
+        blockSettingsAndUninstall: Boolean = true,
+        blockPowerMenu: Boolean = true
+    ) {
+        if (appDurationMinutesMap.isEmpty()) return
+        refreshState(context)
+
         val prefs = getPrefs(context)
+        val currentMap = readAppTimersMap(prefs).toMutableMap()
+        val nowRealtime = SystemClock.elapsedRealtime()
+
+        for ((pkg, mins) in appDurationMinutesMap) {
+            val durationMs = mins.coerceAtLeast(1) * 60_000L
+            val existing = currentMap[pkg]
+            if (existing == null || durationMs > existing.remainingMs) {
+                currentMap[pkg] = AppTimerState(
+                    packageName = pkg,
+                    remainingMs = durationMs,
+                    totalDurationMs = maxOf(durationMs, existing?.totalDurationMs ?: durationMs)
+                )
+            }
+        }
 
         prefs.edit()
-            .putBoolean(KEY_IS_LOCKED, true)
-            .putLong(KEY_TOTAL_DURATION_MS, totalDurationMs)
-            .putLong(KEY_ACCUMULATED_ELAPSED_MS, 0L)
+            .putString(KEY_APP_TIMERS_JSON, serializeAppTimersMap(currentMap))
             .putLong(KEY_LAST_BOOT_REALTIME_MS, nowRealtime)
-            .putStringSet(KEY_BLOCKED_PACKAGES, blockedPackages)
             .putBoolean(KEY_BLOCK_SETTINGS, blockSettingsAndUninstall)
             .putBoolean(KEY_BLOCK_POWER_MENU, blockPowerMenu)
-            .putInt(KEY_TAMPER_ATTEMPTS, 0)
-            .remove(KEY_LAST_BLOCKED_REASON)
             .commit()
 
         refreshState(context)
     }
+    @Synchronized
+    fun lockPackagesWithDurationMs(
+        context: Context,
+        durationMs: Long,
+        packages: Set<String>,
+        blockSettingsAndUninstall: Boolean? = null,
+        blockPowerMenu: Boolean? = null
+    ) {
+        if (packages.isEmpty() || durationMs <= 0L) return
+
+        // First advance any existing running timers to the current monotonic timestamp
+        refreshState(context)
+
+        val prefs = getPrefs(context)
+        val currentMap = readAppTimersMap(prefs).toMutableMap()
+        val nowRealtime = SystemClock.elapsedRealtime()
+
+        for (pkg in packages) {
+            val existing = currentMap[pkg]
+            // Anti-cheat rule: never allow shortening an already running timer for an app
+            if (existing == null || durationMs > existing.remainingMs) {
+                currentMap[pkg] = AppTimerState(
+                    packageName = pkg,
+                    remainingMs = durationMs,
+                    totalDurationMs = maxOf(durationMs, existing?.totalDurationMs ?: durationMs)
+                )
+            }
+        }
+
+        val editor = prefs.edit()
+            .putString(KEY_APP_TIMERS_JSON, serializeAppTimersMap(currentMap))
+            .putLong(KEY_LAST_BOOT_REALTIME_MS, nowRealtime)
+
+        if (blockSettingsAndUninstall != null) {
+            editor.putBoolean(KEY_BLOCK_SETTINGS, blockSettingsAndUninstall)
+        }
+        if (blockPowerMenu != null) {
+            editor.putBoolean(KEY_BLOCK_POWER_MENU, blockPowerMenu)
+        }
+
+        editor.commit()
+        refreshState(context)
+    }
 
     /**
-     * Updates the monotonic elapsed time checkpoint and returns the current LockSessionState.
+     * Adds additional apps to match the longest currently running timer.
+     */
+    @Synchronized
+    fun addPackagesToActiveLock(context: Context, additionalPackages: Set<String>) {
+        val state = refreshState(context)
+        if (!state.isLocked || additionalPackages.isEmpty()) return
+        lockPackagesWithDurationMs(
+            context = context,
+            durationMs = state.remainingMs,
+            packages = additionalPackages
+        )
+    }
+
+    /**
+     * Updates all active per-app monotonic timers and removes any apps whose timers have finished.
      * Completely immune to manual system clock manipulation.
-     * Across hardware reboots, resumes from the last persisted accumulated time + new boot uptime.
      */
     @Synchronized
     fun refreshState(context: Context): LockSessionState {
         val prefs = getPrefs(context)
-        val isLocked = prefs.getBoolean(KEY_IS_LOCKED, false)
+        val currentMap = readAppTimersMap(prefs)
 
-        if (!isLocked) {
+        if (currentMap.isEmpty()) {
             val unlockedState = LockSessionState(
                 isLocked = false,
-                blockedPackages = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet(),
+                remainingMs = 0L,
+                totalDurationMs = 0L,
+                blockedPackages = emptySet(),
+                appTimers = emptyMap(),
                 blockSettingsAndUninstall = prefs.getBoolean(KEY_BLOCK_SETTINGS, true),
-                blockPowerMenu = prefs.getBoolean(KEY_BLOCK_POWER_MENU, true)
+                blockPowerMenu = prefs.getBoolean(KEY_BLOCK_POWER_MENU, true),
+                tamperAttempts = prefs.getInt(KEY_TAMPER_ATTEMPTS, 0)
             )
             _stateFlow.value = unlockedState
             return unlockedState
         }
 
-        val totalDurationMs = prefs.getLong(KEY_TOTAL_DURATION_MS, 0L)
-        val previousAccumulatedMs = prefs.getLong(KEY_ACCUMULATED_ELAPSED_MS, 0L)
         val lastBootRealtimeMs = prefs.getLong(KEY_LAST_BOOT_REALTIME_MS, 0L)
         val nowRealtimeMs = SystemClock.elapsedRealtime()
 
-        // If nowRealtimeMs >= lastBootRealtimeMs, we are in the same boot session.
-        // If nowRealtimeMs < lastBootRealtimeMs, the device rebooted, so delta since reboot is nowRealtimeMs.
         val deltaMs = if (nowRealtimeMs >= lastBootRealtimeMs && lastBootRealtimeMs > 0L) {
             nowRealtimeMs - lastBootRealtimeMs
         } else {
-            // Device rebooted: count monotonic time elapsed since the reboot
+            // Device rebooted: count monotonic time elapsed since reboot
             nowRealtimeMs.coerceAtLeast(0L)
         }
 
-        val newAccumulatedMs = (previousAccumulatedMs + deltaMs).coerceAtMost(totalDurationMs)
-        val remainingMs = (totalDurationMs - newAccumulatedMs).coerceAtLeast(0L)
+        val updatedMap = mutableMapOf<String, AppTimerState>()
+        for ((pkg, timerState) in currentMap) {
+            val newRemaining = (timerState.remainingMs - deltaMs).coerceAtLeast(0L)
+            if (newRemaining > 0L) {
+                updatedMap[pkg] = timerState.copy(remainingMs = newRemaining)
+            }
+        }
 
-        if (remainingMs <= 0L) {
-            // Timer completed legitimately!
+        if (updatedMap.isEmpty()) {
+            // All app timers completed!
             prefs.edit()
-                .putBoolean(KEY_IS_LOCKED, false)
-                .putLong(KEY_ACCUMULATED_ELAPSED_MS, 0L)
+                .remove(KEY_APP_TIMERS_JSON)
                 .putLong(KEY_LAST_BOOT_REALTIME_MS, 0L)
                 .remove(KEY_LAST_BLOCKED_REASON)
+                .remove(KEY_LAST_BLOCKED_PACKAGE)
                 .commit()
 
             val completedState = LockSessionState(
                 isLocked = false,
                 remainingMs = 0L,
                 totalDurationMs = 0L,
-                blockedPackages = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet(),
+                blockedPackages = emptySet(),
+                appTimers = emptyMap(),
                 blockSettingsAndUninstall = prefs.getBoolean(KEY_BLOCK_SETTINGS, true),
                 blockPowerMenu = prefs.getBoolean(KEY_BLOCK_POWER_MENU, true),
                 tamperAttempts = prefs.getInt(KEY_TAMPER_ATTEMPTS, 0)
@@ -139,66 +242,79 @@ object LockStateManager {
             return completedState
         }
 
-        // Persist checkpoint so forced power-offs cannot lose progress or reset state
+        // Persist updated per-app timers checkpoint
         prefs.edit()
-            .putLong(KEY_ACCUMULATED_ELAPSED_MS, newAccumulatedMs)
+            .putString(KEY_APP_TIMERS_JSON, serializeAppTimersMap(updatedMap))
             .putLong(KEY_LAST_BOOT_REALTIME_MS, nowRealtimeMs)
             .commit()
 
+        val maxRemainingMs = updatedMap.values.maxOf { it.remainingMs }
+        val maxTotalDurationMs = updatedMap.values.maxOf { it.totalDurationMs }
+
         val activeState = LockSessionState(
             isLocked = true,
-            remainingMs = remainingMs,
-            totalDurationMs = totalDurationMs,
-            blockedPackages = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet(),
+            remainingMs = maxRemainingMs,
+            totalDurationMs = maxTotalDurationMs,
+            blockedPackages = updatedMap.keys,
+            appTimers = updatedMap,
             blockSettingsAndUninstall = prefs.getBoolean(KEY_BLOCK_SETTINGS, true),
             blockPowerMenu = prefs.getBoolean(KEY_BLOCK_POWER_MENU, true),
             tamperAttempts = prefs.getInt(KEY_TAMPER_ATTEMPTS, 0),
-            lastBlockedReason = prefs.getString(KEY_LAST_BLOCKED_REASON, null)
+            lastBlockedReason = prefs.getString(KEY_LAST_BLOCKED_REASON, null),
+            lastBlockedPackage = prefs.getString(KEY_LAST_BLOCKED_PACKAGE, null)
         )
         _stateFlow.value = activeState
         return activeState
     }
 
     /**
+     * Returns the remaining lock time for a specific package, or the overall max remaining time
+     * if [packageName] is null (e.g. when Settings or Power Menu is blocked).
+     */
+    @Synchronized
+    fun getRemainingMsForPackage(context: Context, packageName: String?): Long {
+        val state = refreshState(context)
+        if (!state.isLocked) return 0L
+        if (packageName != null) {
+            state.appTimers[packageName]?.let { return it.remainingMs }
+        }
+        return state.remainingMs
+    }
+
+    /**
      * Records a cheat/tamper or blocked-app open attempt during an active lock.
      */
     @Synchronized
-    fun recordViolation(context: Context, reason: String) {
+    fun recordViolation(context: Context, reason: String, blockedPackage: String? = null) {
         val prefs = getPrefs(context)
-        if (!prefs.getBoolean(KEY_IS_LOCKED, false)) return
+        val state = refreshState(context)
+        if (!state.isLocked) return
         val attempts = prefs.getInt(KEY_TAMPER_ATTEMPTS, 0) + 1
-        prefs.edit()
+        val editor = prefs.edit()
             .putInt(KEY_TAMPER_ATTEMPTS, attempts)
             .putString(KEY_LAST_BLOCKED_REASON, reason)
-            .commit()
+        if (blockedPackage != null) {
+            editor.putString(KEY_LAST_BLOCKED_PACKAGE, blockedPackage)
+        } else {
+            editor.remove(KEY_LAST_BLOCKED_PACKAGE)
+        }
+        editor.commit()
         refreshState(context)
     }
 
     /**
-     * Saves the user's selected blocked packages before starting the timer.
+     * Saves draft selected packages in the UI picker.
      */
     @Synchronized
     fun saveSelectedPackages(context: Context, packages: Set<String>) {
         val prefs = getPrefs(context)
-        if (prefs.getBoolean(KEY_IS_LOCKED, false)) return // Cannot remove apps while locked!
-        prefs.edit().putStringSet(KEY_BLOCKED_PACKAGES, packages).apply()
-        refreshState(context)
+        prefs.edit().putStringSet(KEY_DRAFT_SELECTED_PACKAGES, packages).apply()
     }
 
-    /**
-     * Allows adding more apps to an already running lock timer.
-     * Existing locked apps are strictly preserved and cannot be removed until the timer ends.
-     */
     @Synchronized
-    fun addPackagesToActiveLock(context: Context, additionalPackages: Set<String>) {
-        if (additionalPackages.isEmpty()) return
+    fun getDraftSelectedPackages(context: Context): Set<String> {
         val prefs = getPrefs(context)
-        val currentBlocked = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet()
-        val mergedBlocked = currentBlocked + additionalPackages
-        prefs.edit()
-            .putStringSet(KEY_BLOCKED_PACKAGES, mergedBlocked)
-            .commit()
-        refreshState(context)
+        return prefs.getStringSet(KEY_DRAFT_SELECTED_PACKAGES, emptySet()) ?: emptySet()
     }
 
     /**
@@ -209,8 +325,46 @@ object LockStateManager {
         val state = refreshState(context)
         if (state.isLocked) {
             val prefs = getPrefs(context)
-            // Reset last_boot_realtime_ms to 0 so the next boot starts counting from 0
             prefs.edit().putLong(KEY_LAST_BOOT_REALTIME_MS, 0L).commit()
         }
+    }
+
+    private fun readAppTimersMap(prefs: SharedPreferences): Map<String, AppTimerState> {
+        val rawJson = prefs.getString(KEY_APP_TIMERS_JSON, null)
+        if (rawJson.isNullOrBlank()) return emptyMap()
+
+        return runCatching {
+            val root = JSONObject(rawJson)
+            val result = mutableMapOf<String, AppTimerState>()
+            val keys = root.keys()
+            while (keys.hasNext()) {
+                val pkg = keys.next()
+                val obj = root.optJSONObject(pkg) ?: continue
+                val remaining = obj.optLong("remainingMs", 0L)
+                val total = obj.optLong("totalDurationMs", remaining)
+                if (remaining > 0L) {
+                    result[pkg] = AppTimerState(
+                        packageName = pkg,
+                        remainingMs = remaining,
+                        totalDurationMs = total
+                    )
+                }
+            }
+            result
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun serializeAppTimersMap(map: Map<String, AppTimerState>): String {
+        val root = JSONObject()
+        for ((pkg, state) in map) {
+            if (state.remainingMs > 0L) {
+                val obj = JSONObject().apply {
+                    put("remainingMs", state.remainingMs)
+                    put("totalDurationMs", state.totalDurationMs)
+                }
+                root.put(pkg, obj)
+            }
+        }
+        return root.toString()
     }
 }

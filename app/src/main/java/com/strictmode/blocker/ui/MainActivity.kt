@@ -139,6 +139,8 @@ fun StrictLockAppScreen() {
     var installedApps by remember { mutableStateOf<List<InstalledAppInfo>>(emptyList()) }
     var isLoadingApps by remember { mutableStateOf(true) }
     var selectedPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var customAppTimers by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    var appForCustomTimerDialog by remember { mutableStateOf<InstalledAppInfo?>(null) }
     var searchQuery by remember { mutableStateOf("") }
 
     var durationMinutes by remember { mutableIntStateOf(30) }
@@ -178,8 +180,8 @@ fun StrictLockAppScreen() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        val initial = LockStateManager.refreshState(context)
-        selectedPackages = initial.blockedPackages
+        LockStateManager.refreshState(context)
+        selectedPackages = LockStateManager.getDraftSelectedPackages(context)
         installedApps = AppRepository.getLaunchableApps(context)
         isLoadingApps = false
     }
@@ -202,6 +204,7 @@ fun StrictLockAppScreen() {
             installedApps = installedApps,
             isLoadingApps = isLoadingApps,
             selectedPackages = selectedPackages,
+            customAppTimers = customAppTimers,
             onTogglePackage = { pkg ->
                 val updated = if (pkg in selectedPackages) {
                     selectedPackages - pkg
@@ -211,6 +214,9 @@ fun StrictLockAppScreen() {
                 selectedPackages = updated
                 LockStateManager.saveSelectedPackages(context, updated)
             },
+            onOpenCustomTimerForApp = { app ->
+                appForCustomTimerDialog = app
+            },
             onSelectAllVisible = { visiblePkgs ->
                 val updated = selectedPackages + visiblePkgs
                 selectedPackages = updated
@@ -218,6 +224,7 @@ fun StrictLockAppScreen() {
             },
             onClearAll = {
                 selectedPackages = emptySet()
+                customAppTimers = emptyMap()
                 LockStateManager.saveSelectedPackages(context, emptySet())
             },
             searchQuery = searchQuery,
@@ -262,6 +269,88 @@ fun StrictLockAppScreen() {
         )
     }
 
+    appForCustomTimerDialog?.let { targetApp ->
+        val initialMins = customAppTimers[targetApp.packageName] ?: durationMinutes
+        var appCustomMins by remember(targetApp.packageName) { mutableIntStateOf(initialMins) }
+        var appCustomText by remember(targetApp.packageName) { mutableStateOf(initialMins.toString()) }
+
+        AlertDialog(
+            onDismissRequest = { appForCustomTimerDialog = null },
+            containerColor = Color(0xFF161B22),
+            titleContentColor = Color.White,
+            textContentColor = Color(0xFFC9D1D9),
+            title = {
+                Text(
+                    text = "Own Timer: ${targetApp.appName}",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Set an independent timer duration for ${targetApp.appName}:",
+                        fontSize = 13.sp,
+                        color = Color(0xFF8B949E)
+                    )
+                    OutlinedTextField(
+                        value = appCustomText,
+                        onValueChange = { text ->
+                            val digits = text.filter { it.isDigit() }.take(4)
+                            val parsed = digits.toIntOrNull()?.coerceIn(1, 1440) ?: 0
+                            appCustomMins = parsed
+                            appCustomText = digits
+                        },
+                        label = { Text("Minutes (1 - 1440)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFFEF4444),
+                            unfocusedBorderColor = Color(0xFF30363D),
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (appCustomMins >= 1) {
+                            customAppTimers = customAppTimers + (targetApp.packageName to appCustomMins)
+                            val updatedSelection = selectedPackages + targetApp.packageName
+                            selectedPackages = updatedSelection
+                            LockStateManager.saveSelectedPackages(context, updatedSelection)
+                        }
+                        appForCustomTimerDialog = null
+                    },
+                    enabled = appCustomMins >= 1,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
+                ) {
+                    Text("Save Own Timer (${appCustomMins}m)", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                Row {
+                    if (targetApp.packageName in customAppTimers) {
+                        TextButton(
+                            onClick = {
+                                customAppTimers = customAppTimers - targetApp.packageName
+                                appForCustomTimerDialog = null
+                            }
+                        ) {
+                            Text("Use Shared Timer", color = Color(0xFFF87171))
+                        }
+                    }
+                    TextButton(onClick = { appForCustomTimerDialog = null }) {
+                        Text("Cancel", color = Color(0xFF8B949E))
+                    }
+                }
+            }
+        )
+    }
+
     if (showConfirmStartDialog) {
         AlertDialog(
             onDismissRequest = { showConfirmStartDialog = false },
@@ -283,12 +372,17 @@ fun StrictLockAppScreen() {
                 )
             },
             text = {
+                val customCount = selectedPackages.count { it in customAppTimers }
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "You are locking ${selectedPackages.size} app(s) for $durationMinutes minute(s)."
+                        if (customCount > 0) {
+                            "You are locking ${selectedPackages.size} app(s) ($customCount with own custom timer, others for $durationMinutes min)."
+                        } else {
+                            "You are locking ${selectedPackages.size} app(s) on the same timer for $durationMinutes minute(s)."
+                        }
                     )
                     Text(
-                        "• You CANNOT open any selected app until the timer reaches 00:00.\n" +
+                        "• Each app unlocks only when its own timer reaches 00:00.\n" +
                             "• You CANNOT uninstall or force-stop StrictLock.\n" +
                             "• Android Settings and Package Installer will be blocked.\n" +
                             "• Power Off / Restart menu will be intercepted, and hardware reboots will auto-resume the timer.",
@@ -301,10 +395,12 @@ fun StrictLockAppScreen() {
                 Button(
                     onClick = {
                         showConfirmStartDialog = false
-                        LockStateManager.startLockSession(
+                        val finalMap = selectedPackages.associateWith { pkg ->
+                            customAppTimers[pkg] ?: durationMinutes
+                        }
+                        LockStateManager.startLockSessionWithCustomTimers(
                             context = context,
-                            durationMinutes = durationMinutes,
-                            blockedPackages = selectedPackages,
+                            appDurationMinutesMap = finalMap,
                             blockSettingsAndUninstall = blockSettingsAndUninstall,
                             blockPowerMenu = blockPowerMenu
                         )
@@ -330,7 +426,9 @@ private fun SetupLockScreen(
     installedApps: List<InstalledAppInfo>,
     isLoadingApps: Boolean,
     selectedPackages: Set<String>,
+    customAppTimers: Map<String, Int>,
     onTogglePackage: (String) -> Unit,
+    onOpenCustomTimerForApp: (InstalledAppInfo) -> Unit,
     onSelectAllVisible: (Set<String>) -> Unit,
     onClearAll: () -> Unit,
     searchQuery: String,
@@ -679,6 +777,8 @@ private fun SetupLockScreen(
                     AppSelectionRow(
                         app = app,
                         isSelected = isSelected,
+                        customTimerMinutes = customAppTimers[app.packageName],
+                        onOwnTimerClick = { onOpenCustomTimerForApp(app) },
                         onToggle = { onTogglePackage(app.packageName) }
                     )
                 }
@@ -778,6 +878,8 @@ private fun PermissionRow(
 private fun AppSelectionRow(
     app: InstalledAppInfo,
     isSelected: Boolean,
+    customTimerMinutes: Int? = null,
+    onOwnTimerClick: (() -> Unit)? = null,
     onToggle: () -> Unit
 ) {
     val iconBitmap = remember(app.packageName) {
@@ -841,6 +943,31 @@ private fun AppSelectionRow(
             )
         }
 
+        if (onOwnTimerClick != null) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (customTimerMinutes != null) Color(0x33EF4444) else Color(0xFF21262D)
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (customTimerMinutes != null) Color(0xFFEF4444) else Color(0xFF30363D),
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .clickable { onOwnTimerClick() }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = if (customTimerMinutes != null) "${customTimerMinutes}m" else "Own Timer",
+                    color = if (customTimerMinutes != null) Color(0xFFFCA5A5) else Color(0xFFC9D1D9),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Spacer(modifier = Modifier.width(6.dp))
+        }
+
         Checkbox(
             checked = isSelected,
             onCheckedChange = { onToggle() },
@@ -852,6 +979,7 @@ private fun AppSelectionRow(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ActiveLockDashboard(
     lockState: LockSessionState,
@@ -861,6 +989,9 @@ private fun ActiveLockDashboard(
     var showAddAppsDialog by remember { mutableStateOf(false) }
     var addSearchQuery by remember { mutableStateOf("") }
     var pendingAdditions by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var useOwnSeparateTimer by remember { mutableStateOf(false) }
+    var newTimerMinutes by remember { mutableIntStateOf(30) }
+    var newTimerCustomText by remember { mutableStateOf("30") }
 
     val progress = if (lockState.totalDurationMs > 0L) {
         (lockState.remainingMs.toFloat() / lockState.totalDurationMs.toFloat()).coerceIn(0f, 1f)
@@ -918,7 +1049,7 @@ private fun ActiveLockDashboard(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "TIME REMAINING",
+                    text = "LONGEST ACTIVE TIMER REMAINING",
                     color = Color(0xFF8B949E),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
@@ -943,7 +1074,7 @@ private fun ActiveLockDashboard(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "No cancel button is available. Protected by Hardware Monotonic Clock, Device Admin, and Power Menu Interception.",
+                    text = "Each app unlocks automatically when its own timer reaches 00:00. Protected by Hardware Monotonic Clock & Device Admin.",
                     color = Color(0xFF8B949E),
                     fontSize = 12.sp
                 )
@@ -997,6 +1128,9 @@ private fun ActiveLockDashboard(
                     onClick = {
                         pendingAdditions = emptySet()
                         addSearchQuery = ""
+                        useOwnSeparateTimer = false
+                        newTimerMinutes = 30
+                        newTimerCustomText = "30"
                         showAddAppsDialog = true
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
@@ -1010,7 +1144,7 @@ private fun ActiveLockDashboard(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Add Apps to Timer",
+                        text = "Add Apps / New Timer",
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
@@ -1023,32 +1157,75 @@ private fun ActiveLockDashboard(
             items = blockedAppModels,
             key = { it.packageName }
         ) { app ->
-            Row(
+            val appTimer = lockState.appTimers[app.packageName]
+            val appRemainingMs = appTimer?.remainingMs ?: lockState.remainingMs
+            val appTotalMs = appTimer?.totalDurationMs ?: lockState.totalDurationMs
+            val appProgress = if (appTotalMs > 0L) {
+                (appRemainingMs.toFloat() / appTotalMs.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF161B22), RoundedCornerShape(12.dp))
+                    .border(1.dp, Color(0xFF21262D), RoundedCornerShape(12.dp))
                     .padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = app.appName,
-                        color = Color.White,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 14.sp
-                    )
-                    Text(
-                        text = app.packageName,
-                        color = Color(0xFF8B949E),
-                        fontSize = 11.sp
-                    )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = app.appName,
+                            color = Color.White,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = app.packageName,
+                            color = Color(0xFF8B949E),
+                            fontSize = 11.sp
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .background(Color(0x22EF4444), RoundedCornerShape(8.dp))
+                                .border(1.dp, Color(0xFFEF4444), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = OverlayShieldManager.formatDuration(appRemainingMs),
+                                color = Color(0xFFFCA5A5),
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Locked",
+                            tint = Color(0xFFEF4444),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = "Locked",
-                    tint = Color(0xFFEF4444),
-                    modifier = Modifier.size(20.dp)
+                LinearProgressIndicator(
+                    progress = { appProgress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = Color(0xFFEF4444),
+                    trackColor = Color(0xFF30363D)
                 )
             }
         }
@@ -1062,7 +1239,7 @@ private fun ActiveLockDashboard(
             textContentColor = Color(0xFFC9D1D9),
             title = {
                 Text(
-                    text = "Add Apps to Active Timer",
+                    text = "Lock More Apps",
                     fontWeight = FontWeight.Bold,
                     fontSize = 18.sp
                 )
@@ -1071,14 +1248,90 @@ private fun ActiveLockDashboard(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(400.dp),
+                        .height(460.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "Select additional apps to lock for the remaining timer. Once added, they cannot be unlocked until the timer reaches 00:00.",
+                        text = "Choose Timer Mode:",
                         fontSize = 12.sp,
-                        color = Color(0xFF8B949E)
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = !useOwnSeparateTimer,
+                            onClick = { useOwnSeparateTimer = false },
+                            label = {
+                                Text(
+                                    "Same Timer (${OverlayShieldManager.formatDuration(lockState.remainingMs)})",
+                                    fontSize = 11.sp
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFFEF4444),
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                        FilterChip(
+                            selected = useOwnSeparateTimer,
+                            onClick = { useOwnSeparateTimer = true },
+                            label = {
+                                Text("Own Separate Timer", fontSize = 11.sp)
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFFEF4444),
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+
+                    if (useOwnSeparateTimer) {
+                        val presets = listOf(15, 30, 45, 60, 120, 240)
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            presets.forEach { preset ->
+                                val label = if (preset >= 60) "${preset / 60}h" else "${preset}m"
+                                FilterChip(
+                                    selected = newTimerMinutes == preset,
+                                    onClick = {
+                                        newTimerMinutes = preset
+                                        newTimerCustomText = preset.toString()
+                                    },
+                                    label = { Text(label, fontSize = 11.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFFEF4444),
+                                        selectedLabelColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = newTimerCustomText,
+                            onValueChange = { text ->
+                                val digits = text.filter { it.isDigit() }.take(4)
+                                val parsed = digits.toIntOrNull()?.coerceIn(1, 1440) ?: 0
+                                newTimerMinutes = parsed
+                                newTimerCustomText = digits
+                            },
+                            label = { Text("Own Timer Duration (Minutes)") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFFEF4444),
+                                unfocusedBorderColor = Color(0xFF30363D),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            )
+                        )
+                    }
 
                     OutlinedTextField(
                         value = addSearchQuery,
@@ -1131,21 +1384,38 @@ private fun ActiveLockDashboard(
                 Button(
                     onClick = {
                         if (pendingAdditions.isNotEmpty()) {
-                            LockStateManager.addPackagesToActiveLock(context, pendingAdditions)
+                            if (useOwnSeparateTimer) {
+                                val mins = newTimerMinutes.coerceAtLeast(1)
+                                LockStateManager.startLockSession(
+                                    context = context,
+                                    durationMinutes = mins,
+                                    blockedPackages = pendingAdditions,
+                                    blockSettingsAndUninstall = lockState.blockSettingsAndUninstall,
+                                    blockPowerMenu = lockState.blockPowerMenu
+                                )
+                                Toast.makeText(
+                                    context,
+                                    "Locked ${pendingAdditions.size} app(s) for $mins min!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                LockStateManager.addPackagesToActiveLock(context, pendingAdditions)
+                                Toast.makeText(
+                                    context,
+                                    "Added ${pendingAdditions.size} app(s) to the active timer!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
                             LockEnforcementService.startOrUpdate(context)
-                            Toast.makeText(
-                                context,
-                                "Locked ${pendingAdditions.size} additional app(s)!",
-                                Toast.LENGTH_SHORT
-                            ).show()
                         }
                         showAddAppsDialog = false
                     },
-                    enabled = pendingAdditions.isNotEmpty(),
+                    enabled = pendingAdditions.isNotEmpty() && (!useOwnSeparateTimer || newTimerMinutes >= 1),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
                 ) {
+                    val modeSuffix = if (useOwnSeparateTimer) "${newTimerMinutes}m" else "Same Timer"
                     Text(
-                        text = "Lock Selected (${pendingAdditions.size})",
+                        text = "Lock (${pendingAdditions.size} • $modeSuffix)",
                         color = Color.White,
                         fontWeight = FontWeight.Bold
                     )
