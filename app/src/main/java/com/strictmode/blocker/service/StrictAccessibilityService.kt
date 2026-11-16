@@ -66,14 +66,15 @@ class StrictAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 3. Only block the explicit Device Admin deactivation screen if user tries to disable Device Admin
+        // 3. Block Android Settings while timer is active (excluding biometric/fingerprint prompts used by banking apps)
         val classLower = eventClass.lowercase()
+        val isBiometricPrompt = classLower.contains("biometric") || classLower.contains("fingerprint")
         if (state.blockSettingsAndUninstall &&
             foregroundPkg == "com.android.settings" &&
-            classLower.contains("deviceadmin")
+            !isBiometricPrompt
         ) {
             blockAndDismiss(
-                reason = "Anti-Cheat: Deactivating Device Admin is locked during an active timer"
+                reason = "Anti-Cheat: Phone Settings are locked during an active timer"
             )
             return
         }
