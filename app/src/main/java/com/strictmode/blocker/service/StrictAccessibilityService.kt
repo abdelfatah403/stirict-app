@@ -9,49 +9,41 @@ import com.strictmode.blocker.data.LockStateManager
 class StrictAccessibilityService : AccessibilityService() {
 
     companion object {
-        // Settings, Package Installers, and OEM App Managers that could be used to uninstall,
-        // force-stop, revoke permissions, or manipulate system date/time during a lock session.
-        private val PROTECTED_SYSTEM_PACKAGES = setOf(
+        // Only the actual Android Settings app and Package Installers
+        private val SETTINGS_AND_INSTALLER_PACKAGES = setOf(
             "com.android.settings",
             "com.google.android.packageinstaller",
             "com.android.packageinstaller",
             "com.samsung.android.packageinstaller",
-            "com.miui.packageinstaller",
-            "com.miui.securitycenter",
-            "com.coloros.safecenter",
-            "com.oplus.safecenter",
-            "com.iqoo.secure",
-            "com.vivo.permissionmanager",
-            "com.huawei.systemmanager"
+            "com.miui.packageinstaller"
         )
 
-        // Power menu class & text signatures across stock Android, Samsung OneUI, Xiaomi MIUI/HyperOS, etc.
-        // Includes both English and Arabic labels for Power Off / Restart.
+        // Exact system Power Menu dialog class names
         private val POWER_MENU_CLASS_KEYWORDS = listOf(
             "globalactions",
-            "shutdown",
             "powermenu",
             "powerdialog",
-            "reboot"
+            "shutdownthread"
         )
 
-        private val POWER_MENU_TEXT_KEYWORDS = listOf(
+        private val POWER_OFF_KEYWORDS = listOf(
             "power off",
+            "shut down",
+            "إيقاف التشغيل",
+            "ايقاف التشغيل"
+        )
+
+        private val RESTART_KEYWORDS = listOf(
             "restart",
             "reboot",
-            "shut down",
-            "turn off",
-            "إيقاف التشغيل",
             "إعادة التشغيل",
-            "اعادة التشغيل",
-            "ايقاف التشغيل"
+            "اعادة التشغيل"
         )
 
         private val UNINSTALL_TEXT_KEYWORDS = listOf(
             "uninstall",
             "force stop",
             "deactivate",
-            "delete app",
             "clear storage",
             "clear data",
             "إلغاء التثبيت",
@@ -70,47 +62,74 @@ class StrictAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+
+        // Ignore background notifications and toast popups completely!
+        // A blocked app (like TikTok) sending a notification while you use Telegram
+        // must NEVER trigger a block.
+        val eventClass = event.className?.toString().orEmpty()
+        if (eventClass.startsWith("android.app.Notification") ||
+            eventClass.startsWith("android.widget.Toast")
+        ) {
+            return
+        }
+
         val state = LockStateManager.refreshState(this)
         if (!state.isLocked) {
             return
         }
 
-        // 1. Check all interactive windows first for the System Power Off / Restart Menu
-        if (state.blockPowerMenu && detectPowerMenu(event)) {
+        // Determine the TRUE foreground window package that the user is currently interacting with
+        val activeRoot = rootInActiveWindow
+        val foregroundPkg = activeRoot?.packageName?.toString()
+            ?: if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                event.packageName?.toString()
+            } else {
+                null
+            } ?: return
+
+        // Never block StrictLock itself
+        if (foregroundPkg == packageName) {
+            return
+        }
+
+        // 1. Check if the Power Off / Restart menu dialog is open
+        if (state.blockPowerMenu && detectPowerMenu(event, activeRoot, foregroundPkg)) {
             blockAndDismiss(
                 reason = "Anti-Cheat: Power Off & Restart are locked during an active timer"
             )
             return
         }
 
-        val pkgName = event?.packageName?.toString() ?: return
-
-        // Never block our own app or the LockShieldActivity
-        if (pkgName == packageName) {
-            return
-        }
-
-        // 2. Check if the user opened a blocked app from their selection list
-        if (pkgName in state.blockedPackages) {
-            val readableName = getReadableAppName(pkgName)
+        // 2. Check ONLY if the true foreground app is in the user's blockedPackages list
+        if (foregroundPkg in state.blockedPackages) {
+            val readableName = getReadableAppName(foregroundPkg)
             blockAndDismiss(
                 reason = "Blocked App: $readableName is locked until its timer ends",
-                blockedPackage = pkgName
+                blockedPackage = foregroundPkg
             )
             return
         }
 
-        // 3. Check if the user opened Settings, Package Installer, or an Uninstall prompt
+        // 3. Check if the user opened Android Settings or tried to Uninstall/Force-Stop StrictLock
         if (state.blockSettingsAndUninstall) {
-            if (pkgName in PROTECTED_SYSTEM_PACKAGES) {
+            // Only block Settings/Installer when it is the actual foreground window
+            if (foregroundPkg in SETTINGS_AND_INSTALLER_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            ) {
                 blockAndDismiss(
                     reason = "Anti-Cheat: Settings & App Uninstall are locked during an active timer"
                 )
                 return
             }
 
-            // Also catch home-screen launcher popups trying to uninstall or force-stop StrictLock
-            if (detectUninstallAttempt(event)) {
+            // Catch App Info / Uninstall dialogs from system installers or OEM app managers targeting StrictLock
+            val isSystemOrInstaller = foregroundPkg in SETTINGS_AND_INSTALLER_PACKAGES ||
+                foregroundPkg.contains("packageinstaller") ||
+                foregroundPkg.contains("permissioncontroller") ||
+                foregroundPkg.contains("securitycenter") ||
+                foregroundPkg.contains("safecenter")
+            if (isSystemOrInstaller && activeRoot != null && detectStrictLockUninstallDialog(activeRoot)) {
                 blockAndDismiss(
                     reason = "Anti-Cheat: Uninstalling or stopping StrictLock is blocked!"
                 )
@@ -119,69 +138,48 @@ class StrictAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun detectPowerMenu(event: AccessibilityEvent?): Boolean {
-        val eventPkg = event?.packageName?.toString().orEmpty()
-        val eventClass = event?.className?.toString()?.lowercase().orEmpty()
+    private fun detectPowerMenu(
+        event: AccessibilityEvent,
+        activeRoot: AccessibilityNodeInfo?,
+        foregroundPkg: String
+    ): Boolean {
+        val eventPkg = event.packageName?.toString().orEmpty()
+        val eventClassLower = event.className?.toString()?.lowercase().orEmpty()
 
-        // Check class name for GlobalActionsDialog / PowerMenu
-        if (POWER_MENU_CLASS_KEYWORDS.any { eventClass.contains(it) }) {
+        // 1. Match explicit Android SystemUI Power Menu dialog class names
+        if ((eventPkg == "com.android.systemui" || eventPkg == "android") &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            POWER_MENU_CLASS_KEYWORDS.any { eventClassLower.contains(it) }
+        ) {
             return true
         }
 
-        // If SystemUI triggered a window change, inspect the node tree and interactive system windows
-        if (eventPkg == "com.android.systemui" || eventPkg == "android") {
-            val rootNode = rootInActiveWindow
-            if (rootNode != null && containsPowerMenuNodes(rootNode)) {
+        // 2. Check if the active foreground window belongs to SystemUI/Android and displays
+        // BOTH a "Power off" option AND a "Restart/Reboot" option (to never confuse it with
+        // normal notifications or the status bar).
+        if ((foregroundPkg == "com.android.systemui" || foregroundPkg == "android") && activeRoot != null) {
+            val texts = mutableListOf<String>()
+            collectNodeTexts(activeRoot, texts, maxDepth = 5)
+            val combined = texts.joinToString(" | ").lowercase()
+
+            val hasPowerOff = POWER_OFF_KEYWORDS.any { combined.contains(it) }
+            val hasRestart = RESTART_KEYWORDS.any { combined.contains(it) }
+            if (hasPowerOff && hasRestart) {
                 return true
             }
         }
 
-        // Also inspect all interactive overlays (e.g. TYPE_SYSTEM_DIALOG / GlobalActions)
-        val currentWindows = runCatching { windows }.getOrNull() ?: emptyList()
-        for (window in currentWindows) {
-            val root = window.root ?: continue
-            val winPkg = root.packageName?.toString().orEmpty()
-            if (winPkg == "com.android.systemui" || winPkg == "android") {
-                if (containsPowerMenuNodes(root)) {
-                    return true
-                }
-            }
-        }
-
         return false
     }
 
-    private fun containsPowerMenuNodes(root: AccessibilityNodeInfo): Boolean {
+    private fun detectStrictLockUninstallDialog(activeRoot: AccessibilityNodeInfo): Boolean {
         val texts = mutableListOf<String>()
-        collectNodeTexts(root, texts, maxDepth = 6)
+        collectNodeTexts(activeRoot, texts, maxDepth = 6)
         val combined = texts.joinToString(" | ").lowercase()
 
-        // Must match at least one power/restart action keyword
-        return POWER_MENU_TEXT_KEYWORDS.any { keyword ->
-            combined.contains(keyword)
-        }
-    }
-
-    private fun detectUninstallAttempt(event: AccessibilityEvent?): Boolean {
-        val eventPkg = event?.packageName?.toString().orEmpty()
-        val isInstallerOrPermission = eventPkg.contains("packageinstaller") ||
-            eventPkg.contains("permissioncontroller")
-
-        val root = rootInActiveWindow ?: return false
-        val texts = mutableListOf<String>()
-        collectNodeTexts(root, texts, maxDepth = 6)
-        val combined = texts.joinToString(" | ").lowercase()
-
-        if (isInstallerOrPermission && UNINSTALL_TEXT_KEYWORDS.any { combined.contains(it) }) {
-            return true
-        }
-
-        // If a dialog mentions our app name ("strictlock") and an uninstall/stop keyword
-        if (combined.contains("strictlock") && UNINSTALL_TEXT_KEYWORDS.any { combined.contains(it) }) {
-            return true
-        }
-
-        return false
+        // Must explicitly mention our app name ("strictlock") AND an uninstall / force-stop action
+        return combined.contains("strictlock") &&
+            UNINSTALL_TEXT_KEYWORDS.any { combined.contains(it) }
     }
 
     private fun collectNodeTexts(

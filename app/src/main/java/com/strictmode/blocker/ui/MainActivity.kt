@@ -404,6 +404,9 @@ fun StrictLockAppScreen() {
                             blockSettingsAndUninstall = blockSettingsAndUninstall,
                             blockPowerMenu = blockPowerMenu
                         )
+                        selectedPackages = emptySet()
+                        customAppTimers = emptyMap()
+                        LockStateManager.saveSelectedPackages(context, emptySet())
                         LockEnforcementService.startOrUpdate(context)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
