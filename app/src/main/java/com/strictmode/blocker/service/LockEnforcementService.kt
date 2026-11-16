@@ -5,6 +5,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -12,8 +14,10 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.strictmode.blocker.R
+import com.strictmode.blocker.data.LockSessionState
 import com.strictmode.blocker.data.LockStateManager
 import com.strictmode.blocker.ui.MainActivity
+import com.strictmode.blocker.util.PermissionHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,6 +33,14 @@ class LockEnforcementService : Service() {
         private const val CHANNEL_ID = "strict_lock_timer_channel"
         private const val NOTIFICATION_ID = 1001
 
+        private val SETTINGS_AND_INSTALLER_PACKAGES = setOf(
+            "com.android.settings",
+            "com.google.android.packageinstaller",
+            "com.android.packageinstaller",
+            "com.samsung.android.packageinstaller",
+            "com.miui.packageinstaller"
+        )
+
         fun startOrUpdate(context: Context) {
             val intent = Intent(context, LockEnforcementService::class.java)
             runCatching {
@@ -43,6 +55,8 @@ class LockEnforcementService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var tickerJob: Job? = null
+    private var lastKnownForegroundPkg: String? = null
+    private var lastBlockedTimestampMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -69,14 +83,15 @@ class LockEnforcementService : Service() {
             return START_NOT_STICKY
         }
 
-        startCountdownLoop()
+        startCountdownAndEnforcementLoop()
         return START_STICKY
     }
 
-    private fun startCountdownLoop() {
+    private fun startCountdownAndEnforcementLoop() {
         if (tickerJob?.isActive == true) return
         tickerJob = serviceScope.launch {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            var tickCount = 0
             while (isActive) {
                 val state = LockStateManager.refreshState(this@LockEnforcementService)
                 if (!state.isLocked) {
@@ -84,11 +99,82 @@ class LockEnforcementService : Service() {
                     stopSelf()
                     break
                 }
-                val notification = buildNotification(state.remainingMs, state.blockedPackages.size)
-                runCatching { nm.notify(NOTIFICATION_ID, notification) }
-                delay(1000L)
+
+                // Poll foreground app every 300ms via UsageStatsManager (100% InstaPay / Banking safe!)
+                checkForegroundAppViaUsageStats(state)
+
+                // Update notification once every ~900ms (every 3rd tick)
+                if (tickCount % 3 == 0) {
+                    val notification = buildNotification(state.remainingMs, state.blockedPackages.size)
+                    runCatching { nm.notify(NOTIFICATION_ID, notification) }
+                }
+                tickCount++
+                delay(300L)
             }
         }
+    }
+
+    private fun checkForegroundAppViaUsageStats(state: LockSessionState) {
+        if (!PermissionHelper.isUsageStatsPermissionGranted(this)) return
+
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return
+        val now = System.currentTimeMillis()
+        val usageEvents = runCatching { usm.queryEvents(now - 4000L, now) }.getOrNull() ?: return
+
+        val event = UsageEvents.Event()
+        var latestResumedPkg: String? = null
+        while (usageEvents.hasNextEvent()) {
+            usageEvents.getNextEvent(event)
+            if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                latestResumedPkg = event.packageName
+            }
+        }
+
+        if (latestResumedPkg != null) {
+            lastKnownForegroundPkg = latestResumedPkg
+        }
+
+        val currentPkg = lastKnownForegroundPkg ?: return
+        if (currentPkg == packageName) return
+
+        // Avoid spamming if we just blocked within the last 800ms
+        if (now - lastBlockedTimestampMs < 800L) return
+
+        if (currentPkg in state.blockedPackages) {
+            lastBlockedTimestampMs = now
+            lastKnownForegroundPkg = null
+            val appName = getReadableAppName(currentPkg)
+            val reason = "Blocked App: $appName is locked until its timer ends"
+            LockStateManager.recordViolation(this, reason, currentPkg)
+            OverlayShieldManager.navigateToHomeLauncher(this)
+            OverlayShieldManager.showShield(
+                context = this,
+                reasonTitle = reason,
+                blockedPackage = currentPkg,
+                useAccessibilityOverlay = false
+            )
+            return
+        }
+
+        if (state.blockSettingsAndUninstall && currentPkg in SETTINGS_AND_INSTALLER_PACKAGES) {
+            lastBlockedTimestampMs = now
+            lastKnownForegroundPkg = null
+            val reason = "Anti-Cheat: Settings & App Uninstall are locked during an active timer"
+            LockStateManager.recordViolation(this, reason)
+            OverlayShieldManager.navigateToHomeLauncher(this)
+            OverlayShieldManager.showShield(
+                context = this,
+                reasonTitle = reason,
+                useAccessibilityOverlay = false
+            )
+        }
+    }
+
+    private fun getReadableAppName(pkgName: String): String {
+        return runCatching {
+            val appInfo = packageManager.getApplicationInfo(pkgName, 0)
+            packageManager.getApplicationLabel(appInfo).toString()
+        }.getOrDefault(pkgName)
     }
 
     private fun buildNotification(remainingMs: Long, blockedCount: Int): Notification {

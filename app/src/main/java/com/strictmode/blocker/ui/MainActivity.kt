@@ -150,6 +150,7 @@ fun StrictLockAppScreen() {
     var showConfirmStartDialog by remember { mutableStateOf(false) }
 
     // Permission states
+    var hasUsageStats by remember { mutableStateOf(PermissionHelper.isUsageStatsPermissionGranted(context)) }
     var hasAccessibility by remember { mutableStateOf(PermissionHelper.isAccessibilityServiceEnabled(context)) }
     var hasDeviceAdmin by remember { mutableStateOf(PermissionHelper.isDeviceAdminEnabled(context)) }
     var hasOverlay by remember { mutableStateOf(PermissionHelper.isOverlayPermissionGranted(context)) }
@@ -164,6 +165,7 @@ fun StrictLockAppScreen() {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
+                hasUsageStats = PermissionHelper.isUsageStatsPermissionGranted(context)
                 hasAccessibility = PermissionHelper.isAccessibilityServiceEnabled(context)
                 hasDeviceAdmin = PermissionHelper.isDeviceAdminEnabled(context)
                 hasOverlay = PermissionHelper.isOverlayPermissionGranted(context)
@@ -239,15 +241,16 @@ fun StrictLockAppScreen() {
             onBlockSettingsChange = { blockSettingsAndUninstall = it },
             blockPowerMenu = blockPowerMenu,
             onBlockPowerMenuChange = { blockPowerMenu = it },
+            hasUsageStats = hasUsageStats,
             hasAccessibility = hasAccessibility,
             hasDeviceAdmin = hasDeviceAdmin,
             hasOverlay = hasOverlay,
             hasBatteryExemption = hasBatteryExemption,
             onStartLockClick = {
-                if (!hasAccessibility || !hasDeviceAdmin || !hasOverlay) {
+                if ((!hasUsageStats && !hasAccessibility) || !hasDeviceAdmin || !hasOverlay) {
                     Toast.makeText(
                         context,
-                        "Please enable all 3 required Anti-Cheat protections first!",
+                        "Please enable Usage Access, Device Admin, and Overlay permissions first!",
                         Toast.LENGTH_LONG
                     ).show()
                 } else if (selectedPackages.isEmpty()) {
@@ -443,6 +446,7 @@ private fun SetupLockScreen(
     onBlockSettingsChange: (Boolean) -> Unit,
     blockPowerMenu: Boolean,
     onBlockPowerMenuChange: (Boolean) -> Unit,
+    hasUsageStats: Boolean,
     hasAccessibility: Boolean,
     hasDeviceAdmin: Boolean,
     hasOverlay: Boolean,
@@ -461,7 +465,7 @@ private fun SetupLockScreen(
         }
     }
 
-    val allRequiredGranted = hasAccessibility && hasDeviceAdmin && hasOverlay
+    val allRequiredGranted = (hasUsageStats || hasAccessibility) && hasDeviceAdmin && hasOverlay
 
     Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -540,12 +544,16 @@ private fun SetupLockScreen(
                     }
 
                     PermissionRow(
-                        title = "Accessibility Service (Required)",
-                        subtitle = "Blocks restricted apps, Settings, and Power Off menu",
-                        isGranted = hasAccessibility,
+                        title = "Usage Access (Required • InstaPay & Banking Safe)",
+                        subtitle = "Detects & blocks apps without Accessibility so InstaPay never crashes",
+                        isGranted = hasUsageStats,
                         onClick = {
                             runCatching {
-                                context.startActivity(PermissionHelper.createAccessibilitySettingsIntent())
+                                context.startActivity(PermissionHelper.createUsageStatsPermissionIntent(context))
+                            }.onFailure {
+                                runCatching {
+                                    context.startActivity(PermissionHelper.createGeneralUsageStatsIntent())
+                                }
                             }
                         }
                     )
@@ -579,6 +587,23 @@ private fun SetupLockScreen(
                         onClick = {
                             runCatching {
                                 context.startActivity(PermissionHelper.createBatteryOptimizationIntent(context))
+                            }
+                        }
+                    )
+
+                    PermissionRow(
+                        title = "Accessibility (Optional • Disable for InstaPay)",
+                        subtitle = if (hasAccessibility) {
+                            "Enabled — Tap 'Manage' to turn OFF if InstaPay or banking apps close"
+                        } else {
+                            "OFF (Recommended so InstaPay & banking apps work normally)"
+                        },
+                        isGranted = hasAccessibility,
+                        alwaysShowButton = true,
+                        buttonLabel = if (hasAccessibility) "Manage" else "Optional",
+                        onClick = {
+                            runCatching {
+                                context.startActivity(PermissionHelper.createAccessibilitySettingsIntent())
                             }
                         }
                     )
@@ -829,6 +854,8 @@ private fun PermissionRow(
     title: String,
     subtitle: String,
     isGranted: Boolean,
+    alwaysShowButton: Boolean = false,
+    buttonLabel: String = "Enable",
     onClick: () -> Unit
 ) {
     Row(
@@ -865,13 +892,13 @@ private fun PermissionRow(
             }
         }
 
-        if (!isGranted) {
+        if (!isGranted || alwaysShowButton) {
             Spacer(modifier = Modifier.width(8.dp))
             OutlinedButton(
                 onClick = onClick,
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text("Enable", color = Color(0xFFF87171), fontSize = 12.sp)
+                Text(buttonLabel, color = Color(0xFFF87171), fontSize = 12.sp)
             }
         }
     }
